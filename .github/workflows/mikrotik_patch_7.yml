@@ -140,7 +140,7 @@ jobs:
           fi
         fi
         echo "has_new_version=true" >> $GITHUB_OUTPUT
-        wget -nv -O CHANGELOG https://${{ env.MIKRO_UPGRADE_URL }}/routeros/$LATEST_VERSION/CHANGELOG
+        wget -nv -O CHANGELOG https://download.mikrotik.com/routeros/$LATEST_VERSION/CHANGELOG
         cat CHANGELOG
         if [[ "${{ matrix.arch }}" == "arm64" ]]; then
           echo "ARCH=-arm64" >> $GITHUB_ENV
