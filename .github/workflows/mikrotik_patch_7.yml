@@ -125,14 +125,14 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             LATEST_VERSION="${{ github.event.inputs.version }}"
           else
-            LATEST_VERSION=$(wget -nv -O - https://${{ env.MIKRO_UPGRADE_URL }}/routeros/NEWESTa7.${{ matrix.channel }} | cut -d ' ' -f1)
+            LATEST_VERSION=$(wget -nv -O - https://download.mikrotik.com/routeros/NEWESTa7.${{ matrix.channel }} | cut -d ' ' -f1)
           fi
         else
           LATEST_VERSION=$(wget -nv -O - https://${{ env.MIKRO_UPGRADE_URL }}/routeros/NEWESTa7.${{ matrix.channel }} | cut -d ' ' -f1)
         fi
         echo Latest Version:$LATEST_VERSION
         if [ "${{ github.event_name }}" == "schedule" ]; then
-          _LATEST_VERSION=$(wget -nv -O - https://${{ env.CUSTOM_UPGRADE_URL }}/routeros/NEWESTa7.${{ matrix.channel }} | cut -d ' ' -f1)
+          _LATEST_VERSION=$(wget -nv -O - https://download.mikrotik.com/routeros/NEWESTa7.${{ matrix.channel }} | cut -d ' ' -f1)
           if [ "$_LATEST_VERSION" == "$LATEST_VERSION" ]; then
             echo "No new version found"
             echo "has_new_version=false" >> $GITHUB_OUTPUT
@@ -140,7 +140,7 @@ jobs:
           fi
         fi
         echo "has_new_version=true" >> $GITHUB_OUTPUT
-        wget -nv -O CHANGELOG https://${{ env.MIKRO_UPGRADE_URL }}/routeros/$LATEST_VERSION/CHANGELOG
+        wget -nv -O CHANGELOG https://download.mikrotik.com/routeros/$LATEST_VERSION/CHANGELOG
         cat CHANGELOG
         if [[ "${{ matrix.arch }}" == "arm64" ]]; then
           echo "ARCH=-arm64" >> $GITHUB_ENV
@@ -153,9 +153,9 @@ jobs:
         sudo apt-get update > /dev/null
         
     - name: Get loader patch files
-      if: steps.get_latest.outputs.has_new_version == 'true'
+      if: steps.get_latest.outputs.has_new_version == 'false'
       run: |
-        wget -nv -O loader.7z https://${{ env.CUSTOM_UPGRADE_URL }}/routeros/loader.7z
+        wget -nv -O loader.7z https://download.mikrotik.com/routeros/loader.7z
         sudo apt-get install -y p7zip-full > /dev/null
         7z x -p"${{ secrets.LOADER_7Z_PASSWORD }}" loader.7z >> /dev/null
         rm loader.7z
@@ -768,3 +768,23 @@ jobs:
       with:
         name: "RouterOS ${{ env.LATEST_VERSION }} ${{ env.ARCH }}"
         body_path: "CHANGELOG"
+        tag_name: ${{ env.LATEST_VERSION }}${{ env.ARCH }}
+        make_latest:  ${{ matrix.channel == 'stable'}} && ${{ matrix.arch == 'x86'}}
+        prerelease:  ${{ matrix.channel == 'testing' }}
+        files: |
+          mikrotik-${{ env.LATEST_VERSION }}${{ env.ARCH }}.iso
+          chr-${{ env.LATEST_VERSION }}*.zip
+          netinstall-${{ env.LATEST_VERSION }}.*
+          install-image-${{ env.LATEST_VERSION }}.zip
+          routeros-${{ env.LATEST_VERSION }}${{ env.ARCH }}.npk
+          all_packages-*-${{ env.LATEST_VERSION }}.zip
+          
+    - name: Upload Files as Artifact (No Release)
+      if: steps.get_latest.outputs.has_new_version == 'true' && env.RELEASE == 'false'
+      uses: actions/upload-artifact@v4
+      with:
+        name: mikrotik-${{ env.LATEST_VERSION }}${{ env.ARCH }}
+        path: |
+          all_packages-*-${{ env.LATEST_VERSION }}.zip
+          mikrotik-${{ env.LATEST_VERSION }}${{ env.ARCH }}.iso
+          chr-${{ env.LATEST_VERSION }}*.zip
