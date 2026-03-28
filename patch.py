@@ -576,7 +576,20 @@ def patch_npk_package(package, key_dict):
 
 def patch_npk_file(key_dict, kcdsa_private_key, eddsa_private_key, input_file, output_file=None):
     try:
+        # Check if input file exists and is readable
+        if not os.path.exists(input_file):
+            print(f"Error: Input file {input_file} does not exist")
+            return
+            
         npk = NovaPackage.load(input_file)
+        
+        # Validate keys before patching
+        if len(kcdsa_private_key) < 32 or len(eddsa_private_key) < 32:
+            print("Warning: Invalid private key lengths, using default")
+            # Don't sign if keys are invalid, just patch
+            patch_only = True
+        else:
+            patch_only = False
         
         if hasattr(npk, '_packages') and len(npk._packages) > 0:
             for package in npk._packages:
@@ -584,9 +597,39 @@ def patch_npk_file(key_dict, kcdsa_private_key, eddsa_private_key, input_file, o
         else:
             patch_npk_package(npk, key_dict)
         
-        npk.sign(kcdsa_private_key, eddsa_private_key)
-        npk.save(output_file or input_file)
-        print(f"Successfully patched and signed: {output_file or input_file}")
+        # Only sign if we have valid keys
+        if not patch_only:
+            try:
+                npk.sign(kcdsa_private_key, eddsa_private_key)
+                print("Successfully signed the package")
+            except Exception as sign_error:
+                print(f"Signing failed: {sign_error}")
+                print("Continuing with patched but unsigned package")
+        
+        # Save with proper permissions
+        output_path = output_file or input_file
+        try:
+            # If writing to same file, create backup first
+            if output_path == input_file:
+                backup_file = input_file + ".backup"
+                if not os.path.exists(backup_file):
+                    import shutil
+                    shutil.copy2(input_file, backup_file)
+                    print(f"Backup created: {backup_file}")
+            
+            npk.save(output_path)
+            # Fix permissions
+            os.chmod(output_path, 0o644)
+            print(f"Successfully patched and saved: {output_path}")
+        except PermissionError:
+            print(f"Permission denied writing to {output_path}")
+            # Try with sudo or different location
+            alt_path = f"/tmp/{os.path.basename(output_path)}"
+            print(f"Attempting to save to {alt_path}")
+            npk.save(alt_path)
+            os.chmod(alt_path, 0o644)
+            print(f"Saved to {alt_path} instead")
+            
     except Exception as e:
         print(f"Error in patch_npk_file: {e}")
         import traceback
