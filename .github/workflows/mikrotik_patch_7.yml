@@ -33,18 +33,26 @@ jobs:
         wget -nv -O pkgs.zip https://download.mikrotik.com/routeros/$V/all_packages-x86-$V.zip
         mkdir -p ./pkgs && unzip pkgs.zip -d ./pkgs
 
-    - name: Patch Loader (The Key Fix)
+    - name: Patch Loader (Aggressive Fix)
       run: |
         mkdir -p ./iso_dir
         xorriso -osirrox on -indev original.iso -extract / ./iso_dir
         chmod -R 777 ./iso_dir
-        # UEFI Kernel Patch
-        mcopy -i ./iso_dir/efiboot.img ::linux.x86_64 ./vmlinux
-        sudo -E python3 patch.py kernel ./vmlinux
-        mcopy -D o -i ./iso_dir/efiboot.img ./vmlinux ::linux.x86_64
-        # Legacy Kernel Patch
-        cp ./vmlinux ./iso_dir/isolinux/linux
 
+        # 1. Patch EFIBOOT (UEFI Mode)
+        mcopy -i ./iso_dir/efiboot.img ::linux.x86_64 ./vmlinux || true
+        sudo -E python3 patch.py kernel ./vmlinux
+        mcopy -D o -i ./iso_dir/efiboot.img ./vmlinux ::linux.x86_64 || true
+
+        # 2. Patch ISOLINUX (Legacy Mode)
+        # Ye installer ka asli kernel hai jo 'broken' error deta hai
+        sudo -E python3 patch.py kernel ./iso_dir/isolinux/linux
+        
+        # 3. Extra Security: Force Replace keys in ALL files inside ISO
+        # Takay installer ka koi bhi component purani key na dekh sakay
+        MIKRO_PUB="c33b9347898862f18390885141e6b3531b402868c78c3c4343166443685e1327"
+        MY_PUB="${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}"
+        find ./iso_dir -type f -exec sudo sed -i "s/$MIKRO_PUB/$MY_PUB/g" {} + 2>/dev/null || true
     - name: Build Option NPK
       run: |
         mkdir -p ./opt/bin
