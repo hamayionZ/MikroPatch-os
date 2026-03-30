@@ -89,13 +89,7 @@ jobs:
         
         # Unmount kar dein
         sudo umount ./iso_mount
-       
-        env:
-        MIKRO_LICENSE_PUBLIC_KEY: ${{ secrets.MIKRO_LICENSE_PUBLIC_KEY || '4a595133644d6736523959326e5535354d6d4a4d6b6e4d50516b32693836374a' }}
-        CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
-        MIKRO_NPK_SIGN_PUBLIC_KEY: ${{ secrets.MIKRO_NPK_SIGN_PUBLIC_KEY || 'c33b9347898862f18390885141e6b3531b402868c78c3c4343166443685e1327' }}
-        CUSTOM_NPK_SIGN_PUBLIC_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}
-        # isi tarah baqi keys...
+      
       run: |
         sudo -E python3 patch.py kernel ./linux_patched
         
