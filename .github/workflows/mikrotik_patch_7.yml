@@ -89,8 +89,7 @@ jobs:
         
         # Unmount kar dein
         sudo umount ./iso_mount
-      
-      run: |
+       run: |
         sudo -E python3 patch.py kernel ./linux_patched
         
         # SABSE ZAROORI: Saari files ki ownership wapis 'runner' user ko dein
