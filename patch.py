@@ -1,88 +1,95 @@
-name: RouterOS 7.22.1 Universal Patcher
-on:
-  workflow_dispatch:
-    inputs:
-      arch:
-        description: 'Architecture'
-        required: true
-        default: 'x86'
-        type: choice
-        options: [x86, arm64]
+import lzma, struct, os, re, argparse
+from npk import NovaPackage, NpkPartID, NpkFileContainer
 
-jobs:
-  Build:
-    runs-on: ubuntu-22.04
-    env:
-      # Inhein GitHub Secrets mein lazmi set karein (64 characters hex)
-      CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
-      CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
-      CUSTOM_NPK_SIGN_PUBLIC_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}
-      CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
-      MIKRO_LICENSE_PUBLIC_KEY: '4a595133644d6736523959326e5535354d6d4a4d6b6e4d50516b32693836374a'
-      MIKRO_NPK_SIGN_PUBLIC_KEY: 'c33b9347898862f18390885141e6b3531b402868c78c3c4343166443685e1327'
+def replace_chunks(old_chunks, new_chunks, data, name):
+    if not all(chunk in data for chunk in old_chunks):
+        return data
+    pattern_parts = [re.escape(chunk) + b'(.{0,6})' for chunk in old_chunks[:-1]]
+    pattern_parts.append(re.escape(old_chunks[-1])) 
+    pattern_bytes = b''.join(pattern_parts)
+    pattern = re.compile(pattern_bytes, flags=re.DOTALL) 
+    def replace_match(match):
+        replaced = b''.join([new_chunks[i] + match.group(i+1) for i in range(len(new_chunks) - 1)])
+        replaced += new_chunks[-1]
+        print(f'[+] {name} patched at offset...')
+        return replaced
+    return re.sub(pattern, replace_match, data)
 
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+def replace_key(old, new, data, name=''):
+    if len(old) < 32 or len(new) < 32: return data
+    # Standard 4-byte chunks
+    old_chunks = [old[i:i+4] for i in range(0, 32, 4)]
+    new_chunks = [new[i:i+4] for i in range(0, 32, 4)]
+    data = replace_chunks(old_chunks, new_chunks, data, name)
+    # Shuffled key map for ROS7
+    key_map = [28,19,25,16,14,3,24,15,22,8,6,17,11,7,9,23,18,13,10,0,26,21,2,5,20,30,31,4,27,29,1,12]
+    try:
+        old_shf = [bytes([old[i]]) for i in key_map]
+        new_shf = [bytes([new[i]]) for i in key_map]
+        data = replace_chunks(old_shf, new_shf, data, name + "_shf")
+    except: pass
+    return data
 
-    - name: Install Tools
-      run: sudo apt-get update && sudo apt-get install -y mkisofs xorriso squashfs-tools mtools wget zip
+def patch_bzimage(data:bytes, key_dict:dict):
+    try:
+        PE_TEXT_OFFSET = 414
+        HDR_PAYLOAD_OFF = 584
+        text_raw = struct.unpack_from('<I',data,PE_TEXT_OFFSET)[0]
+        pay_off = text_raw + struct.unpack_from('<I',data,HDR_PAYLOAD_OFF)[0]
+        pay_len = struct.unpack_from('<I',data,HDR_PAYLOAD_OFF+4)[0] - 4
+        vmlinux_xz = data[pay_off:pay_off+pay_len]
+        vmlinux = lzma.decompress(vmlinux_xz)
+        new_vmlinux = vmlinux
+        for ok, nk in key_dict.items():
+            new_vmlinux = replace_key(ok, nk, new_vmlinux, 'vmlinux')
+        new_xz = lzma.compress(new_vmlinux, check=lzma.CHECK_CRC32, filters=[
+            {"id": lzma.FILTER_X86}, {"id": lzma.FILTER_LZMA2, "preset": 9}
+        ])
+        return data.replace(vmlinux_xz, new_xz.ljust(len(vmlinux_xz), b'\0'))
+    except Exception as e:
+        print(f"[-] bzImage Fail: {e}"); return data
 
-    - name: Download ROS
-      run: |
-        V=$(wget -qO- https://download.mikrotik.com/routeros/NEWESTa7.stable | cut -d ' ' -f1)
-        echo "VERSION=$V" >> $GITHUB_ENV
-        wget -nv -O original.iso https://download.mikrotik.com/routeros/$V/mikrotik-$V.iso
-        wget -nv -O pkgs.zip https://download.mikrotik.com/routeros/$V/all_packages-x86-$V.zip
-        mkdir -p ./pkgs && unzip pkgs.zip -d ./pkgs
+def patch_kernel(data:bytes, key_dict):
+    if data[:2] == b'MZ':
+        return patch_bzimage(data, key_dict)
+    elif data[:4] == b'\x7FELF':
+        # Simple ELF key replacement
+        for ok, nk in key_dict.items(): data = replace_key(ok, nk, data, 'elf')
+        return data
+    return data
 
-    - name: Patch Kernel (The Loader)
-      run: |
-        # ISO extract karein
-        mkdir -p ./iso_dir
-        xorriso -osirrox on -indev original.iso -extract / ./iso_dir
-        chmod -R 777 ./iso_dir
+def patch_npk_file(key_dict, k_priv, e_priv, inf, outf=None):
+    npk = NovaPackage.load(inf)
+    pkgs = npk._packages if len(npk._packages) > 0 else [npk]
+    for p in pkgs:
+        if p[NpkPartID.NAME_INFO].data.name == 'system':
+            fc = NpkFileContainer.unserialize_from(p[NpkPartID.FILE_CONTAINER].data)
+            for item in fc:
+                if item.name in [b'boot/EFI/BOOT/BOOTX64.EFI', b'boot/kernel']:
+                    item.data = patch_kernel(item.data, key_dict)
+            p[NpkPartID.FILE_CONTAINER].data = fc.serialize()
+    npk.sign(k_priv, e_priv)
+    npk.save(outf or inf)
 
-        # UEFI Kernel Patch
-        mcopy -i ./iso_dir/efiboot.img ::linux.x86_64 ./vmlinux
-        sudo -E python3 patch.py kernel ./vmlinux
-        mcopy -D o -i ./iso_dir/efiboot.img ./vmlinux ::linux.x86_64
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    p_npk = subparsers.add_parser('npk'); p_npk.add_argument('input'); p_npk.add_argument('-O','--output')
+    p_ker = subparsers.add_parser('kernel'); p_ker.add_argument('input'); p_ker.add_argument('-O','--output')
+    args = parser.parse_args()
+    
+    m_lic = bytes.fromhex(os.getenv('MIKRO_LICENSE_PUBLIC_KEY', '4a595133644d6736523959326e5535354d6d4a4d6b6e4d50516b32693836374a'))
+    c_lic = bytes.fromhex(os.getenv('CUSTOM_LICENSE_PUBLIC_KEY', '10'*32))
+    m_npk = bytes.fromhex(os.getenv('MIKRO_NPK_SIGN_PUBLIC_KEY', 'c33b9347898862f18390885141e6b3531b402868c78c3c4343166443685e1327'))
+    c_npk = bytes.fromhex(os.getenv('CUSTOM_NPK_SIGN_PUBLIC_KEY', 'a1'*32))
+    
+    key_dict = { m_lic: c_lic, m_npk: c_npk }
+    k_priv = bytes.fromhex(os.getenv('CUSTOM_LICENSE_PRIVATE_KEY', '0'*64))
+    e_priv = bytes.fromhex(os.getenv('CUSTOM_NPK_SIGN_PRIVATE_KEY', '0'*64))
 
-        # Legacy Kernel Patch
-        cp ./vmlinux ./iso_dir/isolinux/linux
-        echo "Loader Patched."
-
-    - name: Create Option NPK
-      run: |
-        # Option SFS build
-        mkdir -p ./opt/bin
-        cp ./busybox/busybox_x86 ./opt/bin/busybox
-        cp ./keygen/keygen_x86 ./opt/bin/keygen
-        chmod +x ./opt/bin/*
-        cd ./opt/bin && for c in $(./busybox --list); do ln -sf busybox $c; done && cd ../..
-        mksquashfs opt option.sfs -quiet -comp xz -no-xattrs -b 256k
-
-        # Build & Sign NPK
-        TEMPLATE=$(find ./pkgs -name "gps-*.npk" | head -n 1)
-        sudo -E python3 npk.py create "$TEMPLATE" ./pkgs/option.npk option ./option.sfs
-        
-        # Sign all packages
-        for f in ./pkgs/*.npk; do
-          sudo -E python3 patch.py npk "$f" || true
-          sudo -E python3 npk.py sign "$f" "$f"
-        done
-
-    - name: Build ISO
-      run: |
-        cp ./pkgs/*.npk ./iso_dir/
-        mkisofs -o patched.iso -V "MikroTik" \
-          -b isolinux/isolinux.bin -c isolinux/boot.cat \
-          -no-emul-boot -boot-load-size 4 -boot-info-table \
-          -eltorito-alt-boot -e efiboot.img -no-emul-boot \
-          -R -J ./iso_dir
-
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: Patched-ISO
-        path: patched.iso
+    if args.command == 'npk':
+        patch_npk_file(key_dict, k_priv, e_priv, args.input, args.output)
+    elif args.command == 'kernel':
+        d = patch_kernel(open(args.input, 'rb').read(), key_dict)
+        open(args.output or args.input, 'wb').write(d)
+    print("[+] Done.")
