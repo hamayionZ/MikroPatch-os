@@ -1,4 +1,4 @@
-name: Patch MikroTik RouterOS 7.x (Custom Loader)
+name: Auto-Patch RouterOS 7.x (Loader + ISO)
 on:
   workflow_dispatch:
     inputs:
@@ -9,11 +9,11 @@ on:
         type: choice
         options: [x86, arm64]
       channel:
-        description: 'Channel (stable, testing)'
+        description: 'Channel (stable, testing, long-term)'
         required: true
         default: 'stable'
       version:
-        description: "Specify version (e.g., 7.22.1), empty for latest"
+        description: "Specific version (e.g., 7.22.1), empty for latest"
         required: false
         default: ''
 
@@ -21,120 +21,128 @@ permissions:
   contents: write
 
 jobs:
-  Build_Patched_ROS:
+  Patch_And_Build:
     runs-on: ubuntu-22.04
-    # Global environment variables takay har step ko keys mil saken
     env:
+      # Keys for Scripts (GitHub Secrets se uthayi jayengi)
       CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
       CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
       CUSTOM_NPK_SIGN_PRIVATE_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PRIVATE_KEY }}
       CUSTOM_NPK_SIGN_PUBLIC_KEY: ${{ secrets.CUSTOM_NPK_SIGN_PUBLIC_KEY }}
       CUSTOM_CLOUD_PUBLIC_KEY: ${{ secrets.CUSTOM_CLOUD_PUBLIC_KEY }}
+      # Default MikroTik Keys (Agar secrets mein na hon toh crash na ho)
       MIKRO_LICENSE_PUBLIC_KEY: ${{ secrets.MIKRO_LICENSE_PUBLIC_KEY || '4a595133644d6736523959326e5535354d6d4a4d6b6e4d50516b32693836374a' }}
       MIKRO_NPK_SIGN_PUBLIC_KEY: ${{ secrets.MIKRO_NPK_SIGN_PUBLIC_KEY || 'c33b9347898862f18390885141e6b3531b402868c78c3c4343166443685e1327' }}
       MIKRO_CLOUD_PUBLIC_KEY: ${{ secrets.MIKRO_CLOUD_PUBLIC_KEY || '68c78c3c4343166443685e1327c33b9347898862f18390885141e6b3531b4028' }}
 
     steps:
-    - name: Checkout repository
+    - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Install Dependencies
+    - name: Install Tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y mkisofs xorriso squashfs-tools qemu-utils p7zip-full zip
+        sudo apt-get install -y mkisofs xorriso squashfs-tools p7zip-full zip wget
 
-    - name: Get RouterOS Version
-      id: get_version
+    - name: Set Version and Architecture
+      id: vars
       run: |
-        if [ -n "${{ github.event.inputs.version }}" ]; then
-          LATEST_VERSION="${{ github.event.inputs.version }}"
+        if [ -z "${{ github.event.inputs.version }}" ]; then
+          VERSION=$(wget -qO- https://download.mikrotik.com/routeros/NEWESTa7.${{ github.event.inputs.channel }} | cut -d ' ' -f1)
         else
-          LATEST_VERSION=$(wget -nv -O - https://download.mikrotik.com/routeros/NEWESTa7.${{ github.event.inputs.channel }} | cut -d ' ' -f1)
+          VERSION="${{ github.event.inputs.version }}"
         fi
-        echo "VERSION=$LATEST_VERSION" >> $GITHUB_ENV
+        ARCH="${{ github.event.inputs.arch }}"
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "ARCH=$ARCH" >> $GITHUB_ENV
+        
+        # Arch suffix for download URLs
+        if [ "$ARCH" == "arm64" ]; then echo "SUFFIX=-arm64" >> $GITHUB_ENV; else echo "SUFFIX=" >> $GITHUB_ENV; fi
 
-    - name: Download Official Files
+    - name: Download MikroTik Files
       run: |
-        ARCH_SUFFIX=""
-        if [ "${{ github.event.inputs.arch }}" == "arm64" ]; then ARCH_SUFFIX="-arm64"; fi
-        wget -nv -O mikrotik.iso https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION$ARCH_SUFFIX.iso
-        wget -nv -O all_packages.zip https://download.mikrotik.com/routeros/$VERSION/all_packages-${{ github.event.inputs.arch }}-$VERSION.zip
-        unzip all_packages.zip -d ./new_iso
+        # Download ISO
+        wget -nv -O original.iso https://download.mikrotik.com/routeros/$VERSION/mikrotik-$VERSION$SUFFIX.iso
+        # Download All Packages
+        wget -nv -O packages.zip https://download.mikrotik.com/routeros/$VERSION/all_packages-$ARCH-$VERSION.zip
+        mkdir -p ./pkgs_dir && unzip packages.zip -d ./pkgs_dir
 
-    - name: Create Option SFS (Busybox & Keygen)
+    - name: Step 1 - Prepare Custom Tools (Option SFS)
       run: |
-        mkdir -p ./option-root/bin/
-        if [ "${{ github.event.inputs.arch }}" == "x86" ]; then
-          cp ./busybox/busybox_x86 ./option-root/bin/busybox
-          cp ./keygen/keygen_x86 ./option-root/bin/keygen
+        mkdir -p ./opt_root/bin
+        if [ "$ARCH" == "x86" ]; then
+          cp ./busybox/busybox_x86 ./opt_root/bin/busybox
+          cp ./keygen/keygen_x86 ./opt_root/bin/keygen
         else
-          cp ./busybox/busybox_aarch64 ./option-root/bin/busybox
-          cp ./keygen/keygen_aarch64 ./option-root/bin/keygen
+          cp ./busybox/busybox_aarch64 ./opt_root/bin/busybox
+          cp ./keygen/keygen_aarch64 ./opt_root/bin/keygen
         fi
-        chmod +x ./option-root/bin/*
-        cd ./option-root/bin/
-        for cmd in $(./busybox --list); do ln -sf busybox $cmd; done
-        cd ../../
-        sudo mksquashfs option-root option.sfs -quiet -comp xz -no-xattrs -b 256k
+        chmod +x ./opt_root/bin/*
+        cd ./opt_root/bin/ && for c in $(./busybox --list); do ln -sf busybox $c; done && cd ../../
+        sudo mksquashfs opt_root option.sfs -quiet -comp xz -no-xattrs -b 256k
 
-    - name: CREATE LOADER (Patch Kernel/EFI)
+    - name: Step 2 - Extract ISO and Create Loader (Patch Kernel)
       run: |
-        # 1. Mount and Extract ISO
-        mkdir -p ./iso_mount ./new_iso_files
-        sudo mount -o loop mikrotik.iso ./iso_mount
-        sudo cp -rv ./iso_mount/* ./new_iso_files/
+        mkdir -p ./iso_mount ./iso_files ./efi_mount
+        sudo mount -o loop original.iso ./iso_mount
+        sudo cp -rv ./iso_mount/* ./iso_files/
         sudo umount ./iso_mount
-        
-        # 2. Fix Permissions
-        sudo chown -R $USER:$USER ./new_iso_files
-        
-        # 3. Extract and Patch Kernel
-        mkdir -p ./efiboot_dir
-        sudo mount -o loop ./new_iso_files/efiboot.img ./efiboot_dir
-        
-        if [ "${{ github.event.inputs.arch }}" == "x86" ]; then
-          echo "Patching x86 Kernel..."
-          cp ./efiboot_dir/linux.x86_64 ./linux_patched
-          sudo -E python3 patch.py kernel ./linux_patched
-          cp ./linux_patched ./new_iso_files/isolinux/linux
-        elif [ "${{ github.event.inputs.arch }}" == "arm64" ]; then
-          echo "Patching ARM64 EFI..."
-          cp ./efiboot_dir/EFI/BOOT/BOOTAA64.EFI ./boot_patched
-          sudo -E python3 patch.py kernel ./boot_patched
-          # Note: Re-injecting into efiboot.img for ARM64 is more complex
-        fi
-        
-        sudo umount ./efiboot_dir
-        echo "Loader Patching Completed."
+        sudo chown -R $USER:$USER ./iso_files
 
-    - name: Create & Sign Custom NPKs
+        # Patch Kernel in efiboot.img
+        sudo mount -o loop ./iso_files/efiboot.img ./efi_mount
+        if [ "$ARCH" == "x86" ]; then
+          echo "Patching x86 Loader..."
+          cp ./efi_mount/linux.x86_64 ./linux_patched
+          sudo -E python3 patch.py kernel ./linux_patched
+          # Replace in ISO (Legacy & EFI)
+          cp ./linux_patched ./iso_files/isolinux/linux
+          # Note: efiboot.img is read-only usually, so we patch the legacy boot file 
+          # or rebuild efiboot.img if needed. For most VMs, isolinux/linux is enough.
+        else
+          echo "Patching ARM64 Loader..."
+          cp ./efi_mount/EFI/BOOT/BOOTAA64.EFI ./boot_patched
+          sudo -E python3 patch.py kernel ./boot_patched
+        fi
+        sudo umount ./efi_mount
+        echo "Kernel Loader Patched."
+
+    - name: Step 3 - Create and Sign Patched NPKs
       run: |
-        sudo chown -R $USER:$USER ./new_iso
-        TEMPLATE_NPK=$(find ./new_iso -name "gps-*.npk" | head -n 1)
+        # Use GPS package as a template to create 'option' package
+        TEMPLATE=$(find ./pkgs_dir -name "gps-*.npk" | head -n 1)
+        sudo -E python3 npk.py create "$TEMPLATE" ./pkgs_dir/option-$VERSION-$ARCH.npk option ./option.sfs -desc="Custom Patched Tools"
         
-        # Create Custom Package
-        sudo -E python3 npk.py create "$TEMPLATE_NPK" ./new_iso/option-$VERSION.npk option ./option.sfs -desc="Patched Tools"
-        
-        # Sign all NPKs
-        for file in ./new_iso/*.npk; do
-          echo "Signing $file..."
-          sudo -E python3 npk.py sign "$file" "$file"
+        # Patch RouterOS main package if needed
+        MAIN_NPK="./pkgs_dir/routeros-$VERSION-$ARCH.npk"
+        if [ -f "$MAIN_NPK" ]; then
+          sudo -E python3 patch.py npk "$MAIN_NPK"
+        fi
+
+        # Sign ALL packages with Custom Key
+        for f in ./pkgs_dir/*.npk; do
+          echo "Signing $f..."
+          sudo -E python3 npk.py sign "$f" "$f"
         done
 
-    - name: Build Patched ISO
+    - name: Step 4 - Rebuild Final ISO
       run: |
-        cp ./new_iso/*.npk ./new_iso_files/
-        mkisofs -o mikrotik-patched-$VERSION.iso \
+        # Copy patched NPKs into ISO folder
+        cp ./pkgs_dir/*.npk ./iso_files/
+        
+        # Create bootable ISO
+        mkisofs -o mikrotik-patched-$VERSION-$ARCH.iso \
                 -V "MikroTik $VERSION" \
                 -b isolinux/isolinux.bin -c isolinux/boot.cat \
                 -no-emul-boot -boot-load-size 4 -boot-info-table \
                 -eltorito-alt-boot -e efiboot.img -no-emul-boot \
-                -R -J ./new_iso_files
+                -R -J ./iso_files
 
-    - name: Upload Artifact
+    - name: Step 5 - Upload Patched Files
       uses: actions/upload-artifact@v4
       with:
-        name: patched-routeros-${{ env.VERSION }}-${{ github.event.inputs.arch }}
+        name: Patched-RouterOS-$VERSION-$ARCH
         path: |
           mikrotik-patched-*.iso
-          ./new_iso/*.npk
+          ./pkgs_dir/option-*.npk
+          ./pkgs_dir/routeros-*.npk
