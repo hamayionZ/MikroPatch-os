@@ -1,1 +1,1 @@
-pefile
+pip install -r
